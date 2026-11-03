@@ -3,6 +3,7 @@
 import math
 import os
 import re
+import struct
 import traceback
 from collections import deque
 from xml.sax.saxutils import quoteattr
@@ -13,8 +14,9 @@ import adsk.fusion
 # Fusion API internal units are cm, kg and radians.
 CM_TO_M = 0.01
 KGCM2_TO_KGM2 = 1e-4
-# Fusion writes STL files in millimetres.
+# Meshes are written by this script in millimetres (see exportMesh).
 MESH_SCALE = 0.001
+CM_TO_MM = 10.0
 MESH_URI = "../meshes/{}"
 
 # URDF requires effort and velocity on every limited joint; Fusion has neither.
@@ -271,18 +273,69 @@ class FusionURDF:
         return occ.bRepBodies.count > 0 or occ.childOccurrences.count > 0
 
     def exportMesh(self, occ, meshPath: str) -> bool:
+        """Write a binary STL of every visible body in occ, in world
+        coordinates and millimetres.
+
+        Fusion's own STL export follows the design's units and may not place
+        parts where they sit in the assembly, so the mesh is computed here
+        instead. Bodies reached through an occurrence are proxies, so their
+        mesh coordinates are in the root (world) context, in cm.
+        """
         try:
-            options = self.exporter.createSTLExportOptions(occ, meshPath)
-            options.sendToPrintUtility = False
-            options.isBinaryFormat = True
-            options.meshRefinement = (
-                adsk.fusion.MeshRefinementSettings.MeshRefinementLow
-            )
-            self.exporter.execute(options)
+            triangles = []
+            for body in self.visibleBodies(occ):
+                calculator = body.meshManager.createMeshCalculator()
+                calculator.setQuality(
+                    adsk.fusion.TriangleMeshQualityOptions.NormalQualityTriangleMesh
+                )
+                mesh = calculator.calculate()
+                coords = mesh.nodeCoordinatesAsFloat
+                indices = mesh.nodeIndices
+                for i in range(0, len(indices) - 2, 3):
+                    tri = []
+                    for idx in indices[i : i + 3]:
+                        tri.append(
+                            (
+                                coords[3 * idx] * CM_TO_MM,
+                                coords[3 * idx + 1] * CM_TO_MM,
+                                coords[3 * idx + 2] * CM_TO_MM,
+                            )
+                        )
+                    triangles.append(tri)
+            if not triangles:
+                self.warnings.append(f"{occ.name} has no visible bodies to mesh.")
+                return False
+            with open(meshPath, "wb") as f:
+                f.write(b"\0" * 80)
+                f.write(struct.pack("<I", len(triangles)))
+                for a, b, c in triangles:
+                    u = [b[k] - a[k] for k in range(3)]
+                    v = [c[k] - a[k] for k in range(3)]
+                    n = (
+                        u[1] * v[2] - u[2] * v[1],
+                        u[2] * v[0] - u[0] * v[2],
+                        u[0] * v[1] - u[1] * v[0],
+                    )
+                    length = math.sqrt(sum(x * x for x in n)) or 1.0
+                    f.write(struct.pack("<3f", *(x / length for x in n)))
+                    for p in (a, b, c):
+                        f.write(struct.pack("<3f", *p))
+                    f.write(b"\0\0")
             return True
         except:
-            self.warnings.append(f"Could not export a mesh for {occ.name}.")
+            self.warnings.append(
+                f"Could not export a mesh for {occ.name}:\n{traceback.format_exc()}"
+            )
             return False
+
+    def visibleBodies(self, occ):
+        """Visible bodies of occ and its visible sub-occurrences (as proxies)."""
+        for body in occ.bRepBodies:
+            if body.isVisible:
+                yield body
+        for child in occ.childOccurrences:
+            if child.isLightBulbOn:
+                yield from self.visibleBodies(child)
 
     @staticmethod
     def massProperties(occurrences: list):
