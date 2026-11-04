@@ -297,8 +297,8 @@ class FusionURDF:
                         tri.append(
                             (
                                 coords[3 * idx] * CM_TO_MM,
+                                -coords[3 * idx + 2] * CM_TO_MM,
                                 coords[3 * idx + 1] * CM_TO_MM,
-                                coords[3 * idx + 2] * CM_TO_MM,
                             )
                         )
                     triangles.append(tri)
@@ -337,28 +337,25 @@ class FusionURDF:
             if child.isLightBulbOn:
                 yield from self.visibleBodies(child)
 
-    @staticmethod
-    def massProperties(occurrences: list):
-        """Combined mass (kg), centre of mass (cm, world) and inertia about the
-        centre of mass (kg*cm^2, world axes) as [xx, yy, zz, xy, yz, xz]."""
+    def massProperties(self, occurrences: list):
         accuracy = adsk.fusion.CalculationAccuracy.HighCalculationAccuracy
         mass = 0.0
         moment = [0.0, 0.0, 0.0]
-        # Inertia about the world origin is additive across occurrences.
         inertia = [0.0] * 6
         for occ in occurrences:
-            props = occ.getPhysicalProperties(accuracy)
-            if props.mass <= 0:
-                continue
-            mass += props.mass
-            com = props.centerOfMass
-            moment = [
-                moment[0] + props.mass * com.x,
-                moment[1] + props.mass * com.y,
-                moment[2] + props.mass * com.z,
-            ]
-            _, xx, yy, zz, xy, yz, xz = props.getXYZMomentsOfInertia()
-            inertia = [a + b for a, b in zip(inertia, [xx, yy, zz, xy, yz, xz])]
+            for body in self.visibleBodies(occ):
+                props = body.getPhysicalProperties(accuracy)
+                if props.mass <= 0:
+                    continue
+                mass += props.mass
+                com = props.centerOfMass
+                moment = [
+                    moment[0] + props.mass * com.x,
+                    moment[1] + props.mass * com.y,
+                    moment[2] + props.mass * com.z,
+                ]
+                _, xx, yy, zz, xy, yz, xz = props.getXYZMomentsOfInertia()
+                inertia = [a + b for a, b in zip(inertia, [xx, yy, zz, xy, yz, xz])]
         if mass <= 0:
             return 0.0, (0.0, 0.0, 0.0), [0.0] * 6
         x, y, z = (m / mass for m in moment)
@@ -374,6 +371,7 @@ class FusionURDF:
         else:
             inertia = [i * KGCM2_TO_KGM2 for i in inertia]
         xx, yy, zz, xy, yz, xz = inertia
+        xx, yy, zz, xy, yz, xz = xx, zz, yy, -xz, -yz, xy
         return (
             "    <inertial>\n" + self.originXml(*offset) + '      <mass value="{}"/>\n'
             '      <inertia ixx="{}" ixy="{}" ixz="{}" iyy="{}" iyz="{}" izz="{}"/>\n'
@@ -655,8 +653,9 @@ class FusionURDF:
 
     @staticmethod
     def direction(vector, sign: float) -> tuple:
-        length = math.sqrt(vector.x**2 + vector.y**2 + vector.z**2) or 1.0
-        return tuple(sign * v / length for v in (vector.x, vector.y, vector.z))
+        x, y, z = vector.x, -vector.z, vector.y
+        length = math.sqrt(x * x + y * y + z * z) or 1.0
+        return tuple(sign * v / length for v in (x, y, z))
 
     def chooseFolder(self):
         folderOpener = self.ui.createFolderDialog()
@@ -668,10 +667,13 @@ class FusionURDF:
     @staticmethod
     def topLevelName(occ) -> str:
         """Name of the top-level occurrence that contains occ."""
-        return occ.fullPathName.split("+")[0]
+        while occ.assemblyContext is not None:
+            occ = occ.assemblyContext
+        return occ.name
 
     def originXml(self, x, y, z, indent="      ") -> str:
         """Origin element from a position in cm."""
+        x, y, z = x, -z, y
         return (
             indent
             + f'<origin xyz="{self.num(x * CM_TO_M)} {self.num(y * CM_TO_M)} {self.num(z * CM_TO_M)}" rpy="0 0 0"/>\n'
